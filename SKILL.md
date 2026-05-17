@@ -388,7 +388,7 @@ EXPLOIT PROOF-OF-CONCEPT:
 ┌─ Finding: [CWE-862] Unauthenticated File Upload ─────────────────────┐
 │                                                                        │
 │  VULNERABLE REQUEST:                                                   │
-│  curl -X POST https://your-app.com/api/activities/any-id/photos \     │
+│  curl -X POST https://example.com/api/activities/any-id/photos \     │
 │    -F "file=@malicious.jpg" \                                         │
 │    -F "note=uploaded without login"                                    │
 │                                                                        │
@@ -400,7 +400,7 @@ EXPLOIT PROOF-OF-CONCEPT:
 │  Attack cost: zero authentication required.                            │
 │                                                                        │
 │  AFTER FIX:                                                            │
-│  curl -X POST https://your-app.com/api/activities/any-id/photos \     │
+│  curl -X POST https://example.com/api/activities/any-id/photos \     │
 │    -F "file=@photo.jpg"                                               │
 │                                                                        │
 │  EXPECTED RESPONSE (fixed):                                            │
@@ -411,14 +411,14 @@ EXPLOIT PROOF-OF-CONCEPT:
 ┌─ Finding: [CWE-601] Open Redirect ───────────────────────────────────┐
 │                                                                        │
 │  VULNERABLE REQUEST:                                                   │
-│  https://your-app.com/api/auth/callback?redirect=https://evil.com     │
+│  https://example.com/api/auth/callback?redirect=https://evil.example     │
 │                                                                        │
 │  WHAT HAPPENS: User clicks what looks like a legitimate link to       │
 │  your app, gets redirected to attacker's site (phishing, credential   │
 │  theft). The URL bar showed your domain initially = trust.             │
 │                                                                        │
 │  AFTER FIX:                                                            │
-│  https://your-app.com/api/auth/callback?redirect=https://evil.com     │
+│  https://example.com/api/auth/callback?redirect=https://evil.example     │
 │  → HTTP 400 {"error":"Invalid redirect URL"}                          │
 │                                                                        │
 │  OR: redirect=/ (relative only) → works as expected                   │
@@ -427,21 +427,20 @@ EXPLOIT PROOF-OF-CONCEPT:
 
 ┌─ Finding: [CWE-89] SQL Injection ────────────────────────────────────┐
 │                                                                        │
-│  VULNERABLE REQUEST:                                                   │
-│  curl https://your-app.com/api/search?q='; DROP TABLE users; --       │
+│  DETECTION TEST:                                                       │
+│  curl https://example.com/api/search?q=' OR '1'='1                  │
+│  → If this returns ALL records instead of none, injection is present  │
 │                                                                        │
 │  WHAT HAPPENS: If the query parameter is concatenated into SQL,       │
 │  the attacker's payload terminates the original query and executes    │
-│  an arbitrary command. In this case, deleting all user data.          │
-│                                                                        │
-│  DETECTION TEST (safe):                                                │
-│  curl https://your-app.com/api/search?q=' OR '1'='1                  │
-│  → If this returns ALL records instead of none, injection is present  │
+│  arbitrary SQL. A destructive payload (DROP TABLE, DELETE FROM)        │
+│  could wipe data entirely. Even a SELECT-based probe leaks records    │
+│  the attacker shouldn't see.                                           │
 │                                                                        │
 │  AFTER FIX (parameterized):                                            │
-│  curl https://your-app.com/api/search?q='; DROP TABLE users; --       │
-│  → Searches literally for the string "; DROP TABLE users; --"         │
+│  curl https://example.com/api/search?q=' OR '1'='1                  │
 │  → Returns 0 results (treated as data, not code)                      │
+│  The query searches literally for the string "' OR '1'='1"            │
 │                                                                        │
 └────────────────────────────────────────────────────────────────────────┘
 ```
