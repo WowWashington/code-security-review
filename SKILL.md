@@ -18,6 +18,28 @@ User says: "security review", "check for vulnerabilities", "audit this code", "f
 - `$ARGUMENTS` may contain: a file path, directory, language hint, or severity filter.
 - If empty, scan the current working directory (respecting .gitignore).
 
+### Argument Sanitization
+
+Before using `$ARGUMENTS` in any shell command (grep, find, etc.):
+
+1. **Validate the argument is a recognized type:**
+   - A file path that exists on disk (verify with `test -e`)
+   - A directory that exists on disk (verify with `test -d`)
+   - A known language keyword: `python`, `javascript`, `typescript`, `go`, `java`, `ruby`, `php`, `rust`, `csharp`
+   - A known severity filter: `critical`, `high`, `medium`, `low`, `all`
+   - A known output format: `compact`, `json`, `detailed`
+
+2. **Reject if the argument contains shell metacharacters:**
+   - Reject: `;` `|` `&` `` ` `` `$` `(` `)` `{` `}` `<` `>` `!` `\n`
+   - If any are present, stop and tell the user: "Argument contains invalid characters. Please provide a file path, directory, or keyword."
+
+3. **Always quote arguments in shell commands:**
+   - Use `grep -rn "$PATTERN"` not `grep -rn $PATTERN`
+   - Use `find "$PATH"` not `find $PATH`
+   - Never construct shell commands by concatenating user input without quoting
+
+4. **Never pass arguments directly as grep patterns.** Arguments select what to scan (paths, language), not what to search for. The grep patterns are hardcoded in the skill.
+
 ## Execution Flow
 
 ### Step 0: Scope Detection
@@ -372,13 +394,39 @@ AUTH CONSISTENCY FINDINGS:
 
 For every HIGH and CRITICAL finding, generate a concrete, copy-paste exploit that demonstrates the vulnerability. This transforms abstract warnings into undeniable proof that something is broken.
 
+**MANDATORY: User Confirmation Before Generating PoCs**
+
+Before generating ANY exploit proof-of-concept, you MUST pause and ask the user:
+
+```
+I've found [N] HIGH/CRITICAL findings that I can generate exploit
+proof-of-concepts for. These will be curl commands demonstrating
+each vulnerability.
+
+Before I generate them, I need to confirm:
+1. Is this your own project? (I only generate PoCs for code you own)
+2. What base URL should I use for the examples?
+   - http://localhost:3000 (local development — safest)
+   - A URL you provide (your own deployment)
+   - https://example.com (placeholder only — not runnable)
+
+Which option?
+```
+
+- **If the user confirms localhost or their own URL** → generate PoCs with that base URL
+- **If the user picks placeholder** → generate with `https://example.com` (educational, not executable)
+- **If the user does not confirm ownership** → do NOT generate PoCs. Skip Step 7 and note in the report: "Exploit PoCs skipped — user did not confirm project ownership."
+- **Never auto-generate PoCs without asking.** The confirmation is not optional.
+
 **Rules:**
-1. Generate exploits ONLY for the user's own project (this is defensive testing)
+1. Generate exploits ONLY after user confirms ownership (see above)
 2. Use standard tools: `curl`, `fetch()`, browser DevTools, or simple scripts
 3. Show the malicious request AND what the expected (bad) response would be
 4. Immediately follow with the "after fix" version showing the safe behavior
 5. Never generate exploits that target third-party systems
 6. Keep payloads educational — demonstrate the concept without providing weaponizable tools
+7. Use only the base URL the user confirmed — never substitute a different domain
+8. If the project has no deployment URL and the user doesn't provide one, default to `http://localhost:3000`
 
 **Format:**
 
