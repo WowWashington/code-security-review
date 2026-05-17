@@ -228,7 +228,292 @@ DEPENDENCIES (<package manager>):
 4. **Confidence matters.** Typosquat detection is fuzzy — mark as MEDIUM confidence unless the name is a known reported incident.
 5. **Suggest tooling.** After the check, recommend the user run `npm audit`, `pip-audit`, `cargo audit`, or `bundler-audit` for CVE-level data that requires registry lookups.
 
-### Step 5: Report
+### Step 5: Taint Tracing (Cross-File Data Flow)
+
+This step goes beyond grep. Read the code and trace user-controlled input from entry to exit. This catches vulnerabilities that span multiple files — the kind that pattern matching alone will never find.
+
+**How to execute:**
+
+1. Identify all **sources** (where untrusted data enters the system):
+   - HTTP request parameters, headers, cookies, body
+   - File uploads (filename, content, metadata)
+   - Database reads that contain user-provided data from earlier requests
+   - Environment variables that could be set by deployment config
+   - CLI arguments, stdin
+   - Webhook payloads, message queue data
+
+2. Identify all **sinks** (where data could cause harm):
+   - SQL/NoSQL queries
+   - Shell commands, process spawning
+   - File system paths (read, write, delete)
+   - HTML/template rendering (XSS)
+   - HTTP responses with sensitive data
+   - Redirect targets (open redirect)
+   - Logging calls (secrets in logs)
+   - Serialization/deserialization
+
+3. For each source, **trace forward** through the code:
+   - Does the data pass through any validation/sanitization function?
+   - Does it get assigned to a new variable and lose its "tainted" identity?
+   - Does it cross a file boundary (exported function, shared module, API call)?
+   - Does it reach a sink? If yes — is the sink protected (parameterized query, escaped template, etc.)?
+
+4. For each finding, document the **full path**:
+
+```
+TAINT TRACE:
+  Source: req.body.userId (src/app/api/users/route.ts:15)
+    → passed to getUser(userId) (src/app/api/users/route.ts:18)
+    → parameter used in db.select().where(eq(users.id, userId)) (src/db/queries.ts:7)
+  Sink: Drizzle ORM eq() — PARAMETERIZED ✓ (safe)
+  Result: NOT VULNERABLE — ORM handles escaping
+
+TAINT TRACE:
+  Source: req.query.redirect (src/app/api/auth/callback/route.ts:5)
+    → passed directly to NextResponse.redirect(redirect) (line 22)
+    → NO validation of URL scheme or domain
+  Sink: HTTP redirect target — OPEN REDIRECT ✗
+  Result: VULNERABLE — attacker controls redirect destination
+  Fix: Validate redirect is relative path or matches allowed domains
+```
+
+**What makes this valuable:** Pattern matching finds `eval(x)` but can't tell whether `x` came from user input or a hardcoded config. Taint tracing answers: "can an attacker actually control this value?" That distinction is the difference between a false positive and a real exploit.
+
+**Focus areas for tracing (in priority order):**
+1. Any data that flows from HTTP request → database query
+2. Any data that flows from HTTP request → file path construction
+3. Any data that flows from HTTP request → command execution
+4. Any data that flows from HTTP request → HTTP redirect or URL construction
+5. Any data from database that contains user-submitted content → HTML rendering
+6. Any data from HTTP request → another HTTP request (SSRF)
+
+### Step 6: Auth Consistency Matrix
+
+Build a complete picture of authentication and authorization across the application. This is not a per-file check — it's a system-level analysis that catches gaps by comparing what protection exists on similar routes.
+
+**How to execute:**
+
+1. **List every route/endpoint** in the application with:
+   - HTTP method (GET, POST, PUT, DELETE)
+   - Path pattern
+   - What auth check is present (if any)
+   - What role/permission is required (if any)
+   - What data it exposes or mutates
+
+2. **Build the matrix:**
+
+```
+AUTH CONSISTENCY MATRIX:
+┌─────────────────────────────────────────────────────────────────────────┐
+│ Route                          │ Method │ Auth? │ Role     │ Action     │
+├─────────────────────────────────────────────────────────────────────────┤
+│ /api/users                     │ GET    │ ✓     │ owner    │ list users │
+│ /api/users                     │ POST   │ ✓     │ owner    │ create     │
+│ /api/users/:id                 │ GET    │ ✗     │ —        ��� read user  │ ← INCONSISTENT
+│ /api/users/:id                 │ PUT    │ ✓     │ varies   │ update     │
+│ /api/users/:id                 │ DELETE │ ✓     │ owner    │ delete     │
+│ /api/projects                  │ GET    │ ✓     │ worker+  │ list       │
+│ /api/projects/:id              │ GET    │ ✗     │ —        │ read       │ ← INTENTIONAL?
+│ /api/projects/:id              │ PUT    │ ✓     │ worker+  │ update     │
+│ /api/projects/:id              │ DELETE │ ✓     │ coord+   │ delete     │
+│ /api/uploads/:path             │ GET    │ ✗     │ —        │ serve file │ ← INTENTIONAL (static)
+│ /api/photos/:id                │ PUT    │ ✗     │ —        │ edit photo │ ← GAP
+│ /api/photos/:id                │ DELETE │ ✗     │ —        │ delete     │ ← GAP
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+3. **Flag inconsistencies:**
+   - Same resource has auth on write but not read (might be intentional, might be a gap)
+   - Similar resources have different auth levels (one CRUD set is protected, another isn't)
+   - Data mutation (POST/PUT/DELETE) without any auth (almost always a bug)
+   - Admin/owner operations accessible at lower role levels
+
+4. **Check ownership patterns (IDOR analysis):**
+   - When a route takes an `:id` parameter, does the handler verify the authenticated user owns/can-access that resource?
+   - Or does it just check "is someone logged in?" without checking "are they allowed to see THIS specific item?"
+   - Common IDOR pattern: auth check passes, but any authenticated user can access any other user's data by guessing IDs
+
+```
+IDOR ANALYSIS:
+  /api/users/:id (GET) — returns user data for ANY id, no ownership check
+    Risk: Any authenticated user can read any other user's profile
+    Question: Is this intended? (crew app where everyone sees everyone = OK)
+
+  /api/projects/:id (PUT) — checks auth but not "does this user belong to this project?"
+    Risk: Worker A could modify Worker B's project
+    Question: Is there project-level access control?
+```
+
+5. **Report format:**
+
+```
+AUTH CONSISTENCY FINDINGS:
+
+  GAPS (unauthenticated mutation):
+    ✗ POST /api/activities/:id/photos — file upload, no auth
+    ✗ DELETE /api/photos/:id — file deletion, no auth
+
+  INCONSISTENCIES (different auth on same resource):
+    ⚠️  /api/users/:id — PUT requires owner/coord, GET requires nothing
+
+  IDOR CANDIDATES (auth present but no ownership check):
+    ? GET /api/users/:id — any session can read any user
+    ? PUT /api/projects/:id — session checked, ownership not checked
+
+  CONSISTENT (properly protected):
+    ✓ /api/users — all methods require owner role
+    ✓ /api/settings — all methods require owner role
+    ✓ /api/auth — rate limited, no enumeration
+```
+
+**Why this matters for beginners:** Most security tutorials focus on "add authentication" but forget authorization. The matrix makes the distinction visible: auth = "are you logged in?", authz = "are you allowed to do THIS specific thing?" The matrix catches both.
+
+### Step 7: Exploit Proof-of-Concept Generation
+
+For every HIGH and CRITICAL finding, generate a concrete, copy-paste exploit that demonstrates the vulnerability. This transforms abstract warnings into undeniable proof that something is broken.
+
+**Rules:**
+1. Generate exploits ONLY for the user's own project (this is defensive testing)
+2. Use standard tools: `curl`, `fetch()`, browser DevTools, or simple scripts
+3. Show the malicious request AND what the expected (bad) response would be
+4. Immediately follow with the "after fix" version showing the safe behavior
+5. Never generate exploits that target third-party systems
+6. Keep payloads educational — demonstrate the concept without providing weaponizable tools
+
+**Format:**
+
+```
+EXPLOIT PROOF-OF-CONCEPT:
+
+┌─ Finding: [CWE-862] Unauthenticated File Upload ─────────────────────┐
+│                                                                        │
+│  VULNERABLE REQUEST:                                                   │
+│  curl -X POST https://your-app.com/api/activities/any-id/photos \     │
+│    -F "file=@malicious.jpg" \                                         │
+│    -F "note=uploaded without login"                                    │
+│                                                                        │
+│  EXPECTED RESPONSE (vulnerable):                                       │
+│  HTTP 201 {"id":"...","fileName":"any-id-1234567.jpg","note":"..."}   │
+│                                                                        │
+│  IMPACT: Anyone on the internet can fill your server's disk with      │
+│  arbitrary files (within the image validation constraints).            │
+│  Attack cost: zero authentication required.                            │
+│                                                                        │
+│  AFTER FIX:                                                            │
+│  curl -X POST https://your-app.com/api/activities/any-id/photos \     │
+│    -F "file=@photo.jpg"                                               │
+│                                                                        │
+│  EXPECTED RESPONSE (fixed):                                            │
+│  HTTP 401 {"error":"Not authenticated"}                               │
+│                                                                        │
+└────────────────────────────────────────────────────────────────────────┘
+
+┌─ Finding: [CWE-601] Open Redirect ───────────────────────────────────┐
+│                                                                        │
+│  VULNERABLE REQUEST:                                                   │
+│  https://your-app.com/api/auth/callback?redirect=https://evil.com     │
+│                                                                        │
+│  WHAT HAPPENS: User clicks what looks like a legitimate link to       │
+│  your app, gets redirected to attacker's site (phishing, credential   │
+│  theft). The URL bar showed your domain initially = trust.             │
+│                                                                        │
+│  AFTER FIX:                                                            │
+│  https://your-app.com/api/auth/callback?redirect=https://evil.com     │
+│  → HTTP 400 {"error":"Invalid redirect URL"}                          │
+│                                                                        │
+│  OR: redirect=/ (relative only) → works as expected                   │
+│                                                                        │
+└────────────────────────────────────────────────────────────────────────┘
+
+┌─ Finding: [CWE-89] SQL Injection ────────────────────────────────────┐
+│                                                                        │
+│  VULNERABLE REQUEST:                                                   │
+│  curl https://your-app.com/api/search?q='; DROP TABLE users; --       │
+│                                                                        │
+│  WHAT HAPPENS: If the query parameter is concatenated into SQL,       │
+│  the attacker's payload terminates the original query and executes    │
+│  an arbitrary command. In this case, deleting all user data.          │
+│                                                                        │
+│  DETECTION TEST (safe):                                                │
+│  curl https://your-app.com/api/search?q=' OR '1'='1                  │
+│  → If this returns ALL records instead of none, injection is present  │
+│                                                                        │
+│  AFTER FIX (parameterized):                                            │
+│  curl https://your-app.com/api/search?q='; DROP TABLE users; --       │
+│  → Searches literally for the string "; DROP TABLE users; --"         │
+│  → Returns 0 results (treated as data, not code)                      │
+│                                                                        │
+└────────────────────────────────────────────────────────────────────────┘
+```
+
+**For supply chain findings, show the risk scenario:**
+
+```
+┌─ Finding: [SC-06] Unpinned GitHub Action ────────────────────────────┐
+│                                                                        │
+│  CURRENT CONFIG:                                                       │
+│  uses: azure/docker-login@v1                                          │
+│                                                                        │
+│  ATTACK SCENARIO:                                                      │
+│  1. Attacker compromises the azure/docker-login repo                  │
+│  2. Pushes malicious code and moves the v1 tag to the new commit     │
+│  3. Your next deploy pulls the compromised action                     │
+│  4. Attacker's code runs with YOUR secrets (ACR_PASSWORD, etc.)       │
+│  5. They now have access to your container registry and Azure creds   │
+│                                                                        │
+│  This has happened in the real world:                                  │
+│  - tj-actions/changed-files (March 2025) — compromised tag            │
+│  - codecov/codecov-action (2021) — supply chain attack via bash uploader│
+│                                                                        │
+│  FIX: Pin to immutable commit SHA                                     │
+│  uses: azure/docker-login@f053f11ee1e8871cf4a2b4f4b93e2c1e6ffb25e3   │
+│                                                                        │
+└────────────────────────────────────────────────────────────────────────┘
+```
+
+**Why this matters:** A report that says "SQL injection possible" gets ignored. A report that includes a curl command proving the database is exposed gets fixed the same day. The PoC makes the risk tangible and undeniable — especially for teams where security isn't the primary expertise.
+
+### Step 8: Security Posture Summary (For Non-Security People)
+
+End the report with a plain-English summary that anyone can understand — no jargon, no CWE numbers, just "here's what this means for your app and your users."
+
+```
+PLAIN-ENGLISH SUMMARY:
+═══════════════════════════════════════════════════
+
+WHO CAN ATTACK THIS APP RIGHT NOW:
+  • Anyone on the internet (no login needed) can upload files to your server
+  • Anyone on the internet can delete photos from your projects
+  • Anyone with a link to your app can see your team's activity history
+
+WHAT COULD HAPPEN:
+  �� Disk filled with junk files → app crashes (denial of service)
+  • Project photos deleted → lost documentation of completed work
+  • Business activity visible to competitors or bad actors
+
+WHAT'S PROTECTING YOU:
+  • All database queries are safe from injection (your ORM handles this)
+  • No passwords or API keys are exposed in the code
+  • Login has brute-force protection (locks out after 5 bad attempts)
+  • File uploads are validated (can't upload malware disguised as images)
+
+EFFORT TO FIX:
+  • 3 files need a 2-line auth check added (30 minutes of work)
+  • 1 file needs "secure: true" added to a cookie (5 minutes)
+  • 1 file needs Math.random replaced with crypto.randomInt (5 minutes)
+  • 1 config file needs SHA hashes looked up (15 minutes)
+
+  Total estimated fix time: ~1 hour
+  Difficulty: straightforward — no architecture changes needed
+
+PRIORITY:
+  Fix the unauthenticated upload/delete routes FIRST.
+  Everything else is defence-in-depth (good practice, not urgent).
+```
+
+**Why this section exists:** Security reports are useless if the person reading them doesn't understand the impact. A developer who isn't a security specialist needs to know: "is this a stop-everything emergency, or a nice-to-have?" This section answers that question in one glance.
+
+### Step 9: Report
 
 Format findings as follows:
 
